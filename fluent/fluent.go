@@ -69,6 +69,9 @@ type Config struct {
 	// respond with an acknowledgement. This option improves the reliability
 	// of the message transmission.
 	RequestAck bool `json:"request_ack"`
+
+	// Number of connections to transmit the logs
+	NumConnections int `json:"num_connections, omitempty"`
 }
 
 type ErrUnknownNetwork struct {
@@ -88,10 +91,15 @@ type msgToSend struct {
 	ack  string
 }
 
+type connection struct {
+	muconn sync.RWMutex
+	conn   net.Conn
+}
+
 type Fluent struct {
 	Config
 
-	dialer dialer
+	//dialer dialer
 	// stopRunning is used in async mode to signal to run() it should abort.
 	stopRunning chan struct{}
 	// cancelDialings is used by Close() to stop any in-progress dialing.
@@ -101,8 +109,9 @@ type Fluent struct {
 	chanClosed     bool
 	wg             sync.WaitGroup
 
-	muconn sync.RWMutex
-	conn   net.Conn
+	//muconn sync.RWMutex
+	//conn   net.Conn
+	connections []connection
 }
 
 type dialer interface {
@@ -114,12 +123,12 @@ func New(config Config) (*Fluent, error) {
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
 	}
-	return newWithDialer(config, &net.Dialer{
+	return newWithDialer(config) /*&net.Dialer{
 		Timeout: config.Timeout,
-	})
+	}*/
 }
 
-func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
+func newWithDialer(config Config /*, d dialer*/) (f *Fluent, err error) {
 	if config.FluentNetwork == "" {
 		config.FluentNetwork = defaultNetwork
 	}
@@ -151,29 +160,37 @@ func newWithDialer(config Config, d dialer) (f *Fluent, err error) {
 		fmt.Fprintf(os.Stderr, "fluent#New: AsyncConnect is now deprecated, please use Async instead")
 		config.Async = config.Async || config.AsyncConnect
 	}
+	if config.NumConnections == 0 {
+		config.NumConnections = 1
+	}
 
 	if config.Async {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		f = &Fluent{
-			Config:         config,
-			dialer:         d,
+			Config: config,
+			//dialer:         d,
 			stopRunning:    make(chan struct{}),
 			cancelDialings: cancel,
 			pending:        make(chan *msgToSend, config.BufferLimit),
 			pendingMutex:   sync.RWMutex{},
-			muconn:         sync.RWMutex{},
+			//muconn:         sync.RWMutex{},
+			connections: make([]connection, config.NumConnections),
 		}
 
-		f.wg.Add(1)
-		go f.run(ctx)
+		for i := 0; i < config.NumConnections; i++ {
+			f.wg.Add(1)
+			go f.run(ctx, i)
+		}
+
 	} else {
 		f = &Fluent{
 			Config: config,
-			dialer: d,
-			muconn: sync.RWMutex{},
+			//dialer: d,
+			//muconn: sync.RWMutex{},
+			connections: make([]connection, config.NumConnections),
 		}
-		err = f.connect(context.Background())
+		err = f.connect(context.Background(), 0)
 	}
 	return
 }
@@ -275,7 +292,7 @@ func (f *Fluent) postRawData(msg *msgToSend) error {
 		return f.appendBuffer(msg)
 	}
 	// Synchronous write
-	return f.writeWithRetry(context.Background(), msg)
+	return f.writeWithRetry(context.Background(), msg, 0)
 }
 
 // For sending forward protocol adopted JSON
@@ -372,9 +389,11 @@ func (f *Fluent) Close() (err error) {
 		}
 	}
 
-	f.muconn.Lock()
-	f.close()
-	f.muconn.Unlock()
+	for i := 0; i < f.Config.NumConnections; i++ {
+		f.connections[i].muconn.Lock()
+		f.close(i)
+		f.connections[i].muconn.Unlock()
+	}
 
 	// If ForceStopAsyncSend is true, we shall close the connection before waiting for
 	// run() goroutine to exit to be sure we aren't waiting on ack message that might
@@ -403,23 +422,36 @@ func (f *Fluent) appendBuffer(msg *msgToSend) error {
 }
 
 // close closes the connection. Callers should take care of locking muconn first.
-func (f *Fluent) close() {
-	if f.conn != nil {
-		f.conn.Close()
-		f.conn = nil
+func (f *Fluent) close(connIndex int) {
+	if f.connections[connIndex].conn != nil {
+		f.connections[connIndex].conn.Close()
+		f.connections[connIndex].conn = nil
 	}
 }
 
 // connect establishes a new connection using the specified transport. Caller should
 // take care of locking muconn first.
-func (f *Fluent) connect(ctx context.Context) (err error) {
+func (f *Fluent) connect(ctx context.Context, connIndex int) (err error) {
+
+	var d net.Dialer
+
+	//f.connections[connIndex].muconn = sync.RWMutex{}
+
 	switch f.Config.FluentNetwork {
-	case "tcp":
+	/*case "tcp":
 		f.conn, err = f.dialer.DialContext(ctx,
 			f.Config.FluentNetwork,
 			f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort))
 	case "unix":
 		f.conn, err = f.dialer.DialContext(ctx,
+			f.Config.FluentNetwork,
+			f.Config.FluentSocketPath)*/
+	case "tcp":
+		f.connections[connIndex].conn, err = d.DialContext(ctx,
+			f.Config.FluentNetwork,
+			f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort))
+	case "unix":
+		f.connections[connIndex].conn, err = d.DialContext(ctx,
 			f.Config.FluentNetwork,
 			f.Config.FluentSocketPath)
 	default:
@@ -432,7 +464,7 @@ func (f *Fluent) connect(ctx context.Context) (err error) {
 var errIsClosing = errors.New("fluent logger is closing")
 
 // Caller should take care of locking muconn first.
-func (f *Fluent) connectWithRetry(ctx context.Context) error {
+func (f *Fluent) connectWithRetry(ctx context.Context, connIndex int) error {
 	// A Time channel is used instead of time.Sleep() to avoid blocking this
 	// goroutine during way too much time (because of the exponential back-off
 	// retry).
@@ -448,7 +480,7 @@ func (f *Fluent) connectWithRetry(ctx context.Context) error {
 	for i := 0; i < f.Config.MaxRetry; i++ {
 		select {
 		case <-timeout.C:
-			err := f.connect(ctx)
+			err := f.connect(ctx, connIndex)
 			if err == nil {
 				return nil
 			}
@@ -476,7 +508,7 @@ func (f *Fluent) connectWithRetry(ctx context.Context) error {
 
 // run is the goroutine used to unqueue and write logs in async mode. That
 // goroutine is meant to run during the whole life of the Fluent logger.
-func (f *Fluent) run(ctx context.Context) {
+func (f *Fluent) run(ctx context.Context, connIndex int) {
 	for {
 		select {
 		case entry, ok := <-f.pending:
@@ -487,7 +519,7 @@ func (f *Fluent) run(ctx context.Context) {
 				return
 			}
 
-			err := f.writeWithRetry(ctx, entry)
+			err := f.writeWithRetry(ctx, entry, connIndex)
 			if err != nil && err != errIsClosing {
 				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
 			}
@@ -511,9 +543,9 @@ func e(x, y float64) int {
 	return int(math.Pow(x, y))
 }
 
-func (f *Fluent) writeWithRetry(ctx context.Context, msg *msgToSend) error {
+func (f *Fluent) writeWithRetry(ctx context.Context, msg *msgToSend, connIndex int) error {
 	for i := 0; i < f.Config.MaxRetry; i++ {
-		if retry, err := f.write(ctx, msg); !retry {
+		if retry, err := f.write(ctx, msg, connIndex); !retry {
 			return err
 		}
 	}
@@ -526,48 +558,48 @@ func (f *Fluent) writeWithRetry(ctx context.Context, msg *msgToSend) error {
 // This method relies on function literals to execute muconn.Unlock or
 // muconn.RUnlock in deferred calls to ensure the mutex is unlocked even in
 // the case of panic recovering.
-func (f *Fluent) write(ctx context.Context, msg *msgToSend) (bool, error) {
-	closer := func() {
-		f.muconn.Lock()
-		defer f.muconn.Unlock()
+func (f *Fluent) write(ctx context.Context, msg *msgToSend, connIndex int) (bool, error) {
+	closer := func(connIndex int) {
+		f.connections[connIndex].muconn.Lock()
+		defer f.connections[connIndex].muconn.Unlock()
 
-		f.close()
+		f.close(connIndex)
 	}
 
-	if err := func() (err error) {
-		f.muconn.Lock()
-		defer f.muconn.Unlock()
+	if err := func(connIndex int) (err error) {
+		f.connections[connIndex].muconn.Lock()
+		defer f.connections[connIndex].muconn.Unlock()
 
-		if f.conn == nil {
-			err = f.connectWithRetry(ctx)
+		if f.connections[connIndex].conn == nil {
+			err = f.connectWithRetry(ctx, connIndex)
 		}
 
 		return err
-	}(); err != nil {
+	}(connIndex); err != nil {
 		// Here, we don't want to retry the write since connectWithRetry already
 		// retries Config.MaxRetry times to connect.
 		return false, fmt.Errorf("fluent#write: %v", err)
 	}
 
-	if err := func() (err error) {
-		f.muconn.RLock()
-		defer f.muconn.RUnlock()
+	if err := func(connIndex int) (err error) {
+		f.connections[connIndex].muconn.RLock()
+		defer f.connections[connIndex].muconn.RUnlock()
 
-		if f.conn == nil {
+		if f.connections[connIndex].conn == nil {
 			return fmt.Errorf("connection has been closed before writing to it.")
 		}
 
 		t := f.Config.WriteTimeout
 		if time.Duration(0) < t {
-			f.conn.SetWriteDeadline(time.Now().Add(t))
+			f.connections[connIndex].conn.SetWriteDeadline(time.Now().Add(t))
 		} else {
-			f.conn.SetWriteDeadline(time.Time{})
+			f.connections[connIndex].conn.SetWriteDeadline(time.Time{})
 		}
 
-		_, err = f.conn.Write(msg.data)
+		_, err = f.connections[connIndex].conn.Write(msg.data)
 		return err
-	}(); err != nil {
-		closer()
+	}(connIndex); err != nil {
+		closer(connIndex)
 		return true, fmt.Errorf("fluent#write: %v", err)
 	}
 
@@ -576,17 +608,17 @@ func (f *Fluent) write(ctx context.Context, msg *msgToSend) (bool, error) {
 		resp := &AckResp{}
 		var err error
 		if f.Config.MarshalAsJSON {
-			dec := json.NewDecoder(f.conn)
+			dec := json.NewDecoder(f.connections[connIndex].conn)
 			err = dec.Decode(resp)
 		} else {
-			r := msgp.NewReader(f.conn)
+			r := msgp.NewReader(f.connections[connIndex].conn)
 			err = resp.DecodeMsg(r)
 		}
 
 		if err != nil || resp.Ack != msg.ack {
 			fmt.Fprintf(os.Stderr, "fluent#write: message ack (%s) doesn't match expected one (%s). Closing connection...", resp.Ack, msg.ack)
 
-			closer()
+			closer(connIndex)
 			return true, err
 		}
 	}
